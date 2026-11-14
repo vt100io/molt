@@ -1,0 +1,6 @@
+# Build output
+molt.duckdb
+molt.duckdb.wal
+
+# Binaries from go build
+/molt
