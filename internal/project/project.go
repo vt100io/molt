@@ -38,6 +38,12 @@ type Model struct {
 	Dependencies []string
 }
 
+// Column is an output column of a model, as DuckDB binds it.
+type Column struct {
+	Name string
+	Type string
+}
+
 // A Test is a query that passes when it returns zero rows.
 type Test struct {
 	Name         string // path relative to tests/, without .sql

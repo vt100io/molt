@@ -13,6 +13,8 @@ import (
 	"github.com/vt100io/molt/internal/build"
 	"github.com/vt100io/molt/internal/compile"
 	"github.com/vt100io/molt/internal/duckdb"
+	"github.com/vt100io/molt/internal/lineage"
+	"github.com/vt100io/molt/internal/plan"
 	"github.com/vt100io/molt/internal/project"
 	"github.com/vt100io/molt/internal/shadow"
 )
@@ -77,12 +79,67 @@ func compileScript(p *project.Project, db *sql.DB, selectors []string) (*compile
 			return nil, err
 		}
 	}
+	columns, lin, err := analyzeColumns(p, db, models)
+	if err != nil {
+		return nil, err
+	}
 	return compile.Compile(p, compile.Options{
 		Models:      models,
 		Vars:        vars,
 		Existing:    existing,
 		FullRefresh: fullRefresh,
+		Columns:     columns,
+		Lineage:     lin,
 	})
+}
+
+// analyzeColumns binds the project in a shadow catalog and returns the output
+// columns and lineage of the selected models, to be recorded in _molt. A model
+// that fails to bind is left out: the build reports the real error. Without
+// lineage (an unverified DuckDB version) the build still runs.
+//
+// Models that are not selected keep the fingerprints recorded when they were
+// built, since the selected models are built from their data as it is.
+func analyzeColumns(p *project.Project, db *sql.DB, models []string) (map[string][]shadow.Column, map[string]*lineage.Model, error) {
+	catalog, err := shadow.Build(p, vars)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer catalog.Close()
+
+	if len(models) < len(p.Models) {
+		built, err := plan.LoadBuilt(db)
+		if err != nil {
+			return nil, nil, err
+		}
+		selected := map[string]bool{}
+		for _, name := range models {
+			selected[name] = true
+		}
+		for name, b := range built.Models {
+			if selected[name] || b.RowsFingerprint == "" {
+				continue
+			}
+			l := &lineage.Model{RowsFingerprint: b.RowsFingerprint}
+			for _, c := range b.Columns {
+				l.Columns = append(l.Columns, lineage.Column{Name: c.Name, Fingerprint: c.Fingerprint})
+			}
+			catalog.Pin(name, l)
+		}
+	}
+
+	columns := map[string][]shadow.Column{}
+	lin := map[string]*lineage.Model{}
+	for _, name := range models {
+		if _, failed := catalog.Errors[name]; failed {
+			continue
+		}
+		columns[name] = catalog.Schemas[name]
+		if l, err := catalog.Lineage(name); err == nil {
+			lin[name] = l
+		}
+	}
+	return columns, lin, nil
 }
 
 var runCmd = &cobra.Command{
@@ -416,7 +473,7 @@ func init() {
 			"Rebuild models from scratch (table and view models always are)")
 	}
 
-	rootCmd.AddCommand(runCmd, compileCmd, testCmd, checkCmd, schemaCmd, explainCmd, lineageCmd, graphCmd)
+	rootCmd.AddCommand(runCmd, compileCmd, planCmd, testCmd, checkCmd, schemaCmd, explainCmd, lineageCmd, graphCmd)
 }
 
 func main() {

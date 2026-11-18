@@ -11,13 +11,20 @@ import (
 type col struct {
 	direct   refSet
 	indirect refSet
+	fp       string // fingerprint, see fingerprint.go
 }
+
+func newCol(fp string) col { return col{refSet{}, refSet{}, fp} }
 
 // stream is the output of an operator: its columns, and the upstream columns
 // that decide which rows it contains.
 type stream struct {
-	cols []col
-	rows refSet
+	cols   []col
+	rows   refSet
+	rowsFP string
+	// order is the fingerprint of an ORDER BY directly below, which matters
+	// to a LIMIT above it but not otherwise.
+	order string
 }
 
 // node and expressions are decoded generically: the plan has many operator
@@ -31,6 +38,8 @@ type walker struct {
 	bindings map[uint64][]col
 	// ctes maps a CTE index to the CTE's output.
 	ctes map[uint64]stream
+	// upstream gives the fingerprints of the columns of scanned tables.
+	upstream Upstream
 }
 
 // PlanError is returned when DuckDB could not bind or serialize the plan.
@@ -50,8 +59,15 @@ func unsupported(format string, args ...any) error {
 
 // Analyze computes the lineage of a model from the output of
 // json_serialize_plan(sql, optimize := false). names are the model's output
-// column names, from the shadow catalog.
-func Analyze(planJSON []byte, names []string) (*Model, error) {
+// column names, from the shadow catalog. upstream gives the fingerprints of
+// the columns of the tables the plan reads; nil hashes table and column name.
+//
+// An approximate Model has no fingerprints: the caller has to derive them from
+// something it trusts, such as the model's SQL.
+func Analyze(planJSON []byte, names []string, upstream Upstream) (*Model, error) {
+	if upstream == nil {
+		upstream = func(table, column string) string { return Hash("table", table, column) }
+	}
 	dec := json.NewDecoder(bytes.NewReader(planJSON))
 	dec.UseNumber() // table indexes use the full uint64 range
 	var doc obj
@@ -67,7 +83,7 @@ func Analyze(planJSON []byte, names []string) (*Model, error) {
 	}
 	root, _ := plans[0].(obj)
 
-	w := &walker{bindings: map[uint64][]col{}, ctes: map[uint64]stream{}}
+	w := &walker{bindings: map[uint64][]col{}, ctes: map[uint64]stream{}, upstream: upstream}
 	out, err := w.node(root)
 	if err == nil && len(out.cols) != len(names) {
 		err = unsupported("plan returns %d columns, model has %d", len(out.cols), len(names))
@@ -80,7 +96,7 @@ func Analyze(planJSON []byte, names []string) (*Model, error) {
 		return approximate(root, names, u.reason), nil
 	}
 
-	m := &Model{Rows: out.rows.sorted()}
+	m := &Model{Rows: out.rows.sorted(), RowsFingerprint: out.rowsFP}
 	for i, c := range out.cols {
 		indirect := refSet{}
 		for r := range c.indirect {
@@ -88,7 +104,9 @@ func Analyze(planJSON []byte, names []string) (*Model, error) {
 				indirect[r] = struct{}{}
 			}
 		}
-		m.Columns = append(m.Columns, Column{Name: names[i], Direct: c.direct.sorted(), Indirect: indirect.sorted()})
+		m.Columns = append(m.Columns, Column{
+			Name: names[i], Direct: c.direct.sorted(), Indirect: indirect.sorted(), Fingerprint: c.fp,
+		})
 	}
 	return m, nil
 }
@@ -170,7 +188,7 @@ func (w *walker) operator(typ string, n obj, children []stream) (stream, error) 
 		if i < len(children) {
 			return children[i]
 		}
-		return stream{rows: refSet{}}
+		return stream{rows: refSet{}, rowsFP: Hash("none")}
 	}
 
 	switch typ {
@@ -178,11 +196,11 @@ func (w *walker) operator(typ string, n obj, children []stream) (stream, error) 
 		return w.get(n, children)
 
 	case "LOGICAL_DUMMY_SCAN":
-		return stream{rows: refSet{}}, nil
+		return stream{rows: refSet{}, rowsFP: Hash("dummy")}, nil
 
 	case "LOGICAL_PROJECTION":
 		in := child(0)
-		out := stream{rows: union(in.rows)}
+		out := stream{rows: union(in.rows), rowsFP: in.rowsFP, order: in.order}
 		for _, e := range arr(n, "expressions") {
 			c, err := w.expr(e, in.cols)
 			if err != nil {
@@ -203,11 +221,17 @@ func (w *walker) operator(typ string, n obj, children []stream) (stream, error) 
 			out.rows.add(c.direct)
 			out.rows.add(c.indirect)
 		}
+		out.rowsFP = Hash("filter", in.rowsFP, w.canon(n["expressions"], in.cols))
 		return project(out, nums(n, "projection_map"))
 
-	case "LOGICAL_ORDER_BY", "LOGICAL_LIMIT", "LOGICAL_SAMPLE":
+	case "LOGICAL_ORDER_BY":
 		in := child(0)
-		return stream{cols: in.cols, rows: union(in.rows)}, nil
+		// Order does not change which rows exist, only which a LIMIT keeps.
+		return stream{cols: in.cols, rows: union(in.rows), rowsFP: in.rowsFP, order: w.canon(n["orders"], in.cols)}, nil
+
+	case "LOGICAL_LIMIT", "LOGICAL_SAMPLE":
+		in := child(0)
+		return stream{cols: in.cols, rows: union(in.rows), rowsFP: Hash(typ, in.rowsFP, in.order, w.params(n))}, nil
 
 	case "LOGICAL_DISTINCT":
 		in := child(0)
@@ -225,6 +249,7 @@ func (w *walker) operator(typ string, n obj, children []stream) (stream, error) 
 			}
 			out.rows.add(c.direct)
 		}
+		out.rowsFP = Hash("distinct", in.rowsFP, colFPs(in.cols), w.canon(targets, in.cols), w.canon(n["order_by"], in.cols))
 		return out, nil
 
 	case "LOGICAL_AGGREGATE_AND_GROUP_BY":
@@ -232,7 +257,7 @@ func (w *walker) operator(typ string, n obj, children []stream) (stream, error) 
 
 	case "LOGICAL_WINDOW":
 		in := child(0)
-		out := stream{cols: append([]col{}, in.cols...), rows: union(in.rows)}
+		out := stream{cols: append([]col{}, in.cols...), rows: union(in.rows), rowsFP: in.rowsFP}
 		var windows []col
 		for _, e := range arr(n, "expressions") {
 			c, err := w.expr(e, in.cols)
@@ -259,6 +284,7 @@ func (w *walker) operator(typ string, n obj, children []stream) (stream, error) 
 			unnests = append(unnests, c)
 			out.rows.add(c.direct) // unnesting multiplies rows
 		}
+		out.rowsFP = Hash("unnest", in.rowsFP, colFPs(unnests))
 		if idx, ok := num(n, "unnest_index"); ok {
 			w.bindings[idx] = unnests
 		}
@@ -270,15 +296,31 @@ func (w *walker) operator(typ string, n obj, children []stream) (stream, error) 
 
 	case "LOGICAL_CROSS_PRODUCT", "LOGICAL_POSITIONAL_JOIN":
 		l, r := child(0), child(1)
-		return stream{cols: concat(l.cols, r.cols), rows: union(l.rows, r.rows)}, nil
+		return stream{cols: concat(l.cols, r.cols), rows: union(l.rows, r.rows), rowsFP: Hash(typ, l.rowsFP, r.rowsFP)}, nil
 
 	case "LOGICAL_UNION", "LOGICAL_EXCEPT", "LOGICAL_INTERSECT":
-		return merge(children)
+		out, err := merge(typ, children)
+		if err != nil {
+			return stream{}, err
+		}
+		// Without ALL, which rows exist depends on the values.
+		all, _ := n["setop_all"].(bool)
+		parts := []string{typ, fmt.Sprint(all)}
+		for _, c := range children {
+			parts = append(parts, c.rowsFP)
+			if !all || typ != "LOGICAL_UNION" {
+				parts = append(parts, colFPs(c.cols))
+			}
+		}
+		out.rowsFP = Hash(parts...)
+		return out, nil
 
 	case "LOGICAL_EXPRESSION_GET":
 		in := child(0)
 		out := stream{rows: union(in.rows)}
-		for _, row := range arr(n, "expressions") {
+		rows := arr(n, "expressions")
+		var fps [][]string
+		for _, row := range rows {
 			rowExprs, _ := row.([]any)
 			for i, e := range rowExprs {
 				c, err := w.expr(e, in.cols)
@@ -286,12 +328,18 @@ func (w *walker) operator(typ string, n obj, children []stream) (stream, error) 
 					return stream{}, err
 				}
 				if i == len(out.cols) {
-					out.cols = append(out.cols, col{refSet{}, refSet{}})
+					out.cols = append(out.cols, newCol(""))
+					fps = append(fps, nil)
 				}
 				out.cols[i].direct.add(c.direct)
 				out.cols[i].indirect.add(c.indirect)
+				fps[i] = append(fps[i], c.fp)
 			}
 		}
+		for i := range out.cols {
+			out.cols[i].fp = Hash(append([]string{"values"}, fps[i]...)...)
+		}
+		out.rowsFP = Hash("values", in.rowsFP, fmt.Sprint(len(rows)))
 		return out, nil
 
 	case "LOGICAL_MATERIALIZED_CTE":
@@ -326,11 +374,16 @@ func (w *walker) operator(typ string, n obj, children []stream) (stream, error) 
 			if err != nil {
 				return stream{}, err
 			}
-			next, err := merge([]stream{anchor, rec, cur})
+			next, err := merge(typ, []stream{anchor, rec, cur})
 			if err != nil {
 				return stream{}, err
 			}
 			if size(next) == size(cur) {
+				// The fingerprint covers the definition, not the iterations.
+				next.rowsFP = Hash(typ, anchor.rowsFP, rec.rowsFP)
+				for i := range next.cols {
+					next.cols[i].fp = Hash(typ, anchor.cols[i].fp, rec.cols[i].fp)
+				}
 				return next, nil
 			}
 			if i == 100 {
@@ -345,7 +398,7 @@ func (w *walker) operator(typ string, n obj, children []stream) (stream, error) 
 		if !ok {
 			return stream{}, unsupported("reference to unknown CTE %d", idx)
 		}
-		return stream{cols: s.cols, rows: union(s.rows)}, nil
+		return stream{cols: s.cols, rows: union(s.rows), rowsFP: s.rowsFP}, nil
 	}
 
 	return stream{}, unsupported("unsupported operator %s", typ)
@@ -367,18 +420,31 @@ func (w *walker) get(n obj, children []stream) (stream, error) {
 		out.rows.add(input.rows)
 	}
 
+	// A table function is identified by its name and arguments.
+	fn := ""
+	if table == "" {
+		fn = w.params(n)
+	}
+	if table != "" {
+		out.rowsFP = Hash("table", table, w.upstream(table, ""))
+	} else {
+		out.rowsFP = Hash("function", fn, input.rowsFP, colFPs(input.cols))
+	}
+
 	for _, ci := range arr(n, "column_indexes") {
 		idx, _ := num(asObj(ci), "index")
-		c := col{refSet{}, refSet{}}
+		c := newCol(Hash("virtual", table, fn, fmt.Sprint(idx)))
 		switch {
 		case table != "" && idx < uint64(len(names)):
 			c.direct[Ref{table, names[idx]}] = struct{}{}
+			c.fp = w.upstream(table, names[idx])
 		case len(children) == 1:
 			// A function of its input: each output depends on all of it.
 			for _, in := range input.cols {
 				c.direct.add(in.direct)
 				c.indirect.add(in.indirect)
 			}
+			c.fp = Hash("function", fn, fmt.Sprint(idx), colFPs(input.cols))
 		}
 		// Otherwise a table function without input (read_csv), or a virtual
 		// column such as rowid: no upstream columns.
@@ -408,6 +474,10 @@ func (w *walker) get(n obj, children []stream) (stream, error) {
 
 func (w *walker) aggregate(n obj, in stream) (stream, error) {
 	out := stream{rows: union(in.rows)}
+	// Aggregates are computed per group: their values depend on the input
+	// rows and the grouping, so both are part of their fingerprints.
+	grouping := Hash("grouping", in.rowsFP, w.canon(n["groups"], in.cols), w.canon(n["grouping_sets"], nil))
+	out.rowsFP = grouping
 
 	var groups []col
 	for _, e := range arr(n, "groups") {
@@ -425,13 +495,14 @@ func (w *walker) aggregate(n obj, in stream) (stream, error) {
 		if err != nil {
 			return stream{}, err
 		}
+		c.fp = Hash("aggregate", c.fp, grouping)
 		aggs = append(aggs, c)
 	}
 
 	// GROUPING(...) columns: which group keys are aggregated away.
 	var groupings []col
 	for _, g := range arr(n, "grouping_functions") {
-		c := col{refSet{}, refSet{}}
+		c := newCol(Hash("grouping_function", grouping, w.canon(g, nil)))
 		list, _ := g.([]any)
 		for _, v := range list {
 			i, ok := toNum(v)
@@ -458,6 +529,7 @@ func (w *walker) aggregate(n obj, in stream) (stream, error) {
 
 func (w *walker) join(n obj, l, r stream) (stream, error) {
 	conds := refSet{}
+	condFP := Hash(str(n, "join_type"), w.params(n))
 	for _, c := range arr(n, "conditions") {
 		cond := asObj(c)
 		lc, err := w.expr(cond["left"], l.cols)
@@ -469,6 +541,7 @@ func (w *walker) join(n obj, l, r stream) (stream, error) {
 			return stream{}, err
 		}
 		conds.add(union(lc.direct, lc.indirect, rc.direct, rc.indirect))
+		condFP = Hash(condFP, lc.fp, str(cond, "comparison"), rc.fp)
 	}
 	if cond, ok := n["condition"]; ok && cond != nil {
 		// ANY_JOIN: an arbitrary predicate over left ++ right.
@@ -477,7 +550,10 @@ func (w *walker) join(n obj, l, r stream) (stream, error) {
 			return stream{}, err
 		}
 		conds.add(union(c.direct, c.indirect))
+		condFP = Hash(condFP, c.fp)
 	}
+	// Any join can drop or repeat rows on either side.
+	rowsFP := Hash("join", l.rowsFP, r.rowsFP, condFP)
 
 	lp, err := project(l, nums(n, "left_projection_map"))
 	if err != nil {
@@ -490,24 +566,25 @@ func (w *walker) join(n obj, l, r stream) (stream, error) {
 
 	switch jt := str(n, "join_type"); jt {
 	case "INNER", "OUTER":
-		return stream{cols: concat(lp.cols, rp.cols), rows: union(l.rows, r.rows, conds)}, nil
+		return stream{cols: concat(lp.cols, rp.cols), rows: union(l.rows, r.rows, conds), rowsFP: rowsFP}, nil
 	case "LEFT", "SINGLE":
 		// Every left row is kept: the condition and the right side's rows only
-		// decide the right columns' values (SINGLE is a scalar subquery).
-		return stream{cols: concat(lp.cols, shaped(rp.cols, union(conds, r.rows))), rows: union(l.rows)}, nil
+		// decide the right columns' values (SINGLE is a scalar subquery). For
+		// fingerprints, a left join can still repeat left rows.
+		return stream{cols: concat(lp.cols, shaped(rp.cols, union(conds, r.rows), condFP)), rows: union(l.rows), rowsFP: rowsFP}, nil
 	case "RIGHT":
-		return stream{cols: concat(shaped(lp.cols, union(conds, l.rows)), rp.cols), rows: union(r.rows)}, nil
+		return stream{cols: concat(shaped(lp.cols, union(conds, l.rows), condFP), rp.cols), rows: union(r.rows), rowsFP: rowsFP}, nil
 	case "SEMI", "ANTI":
-		return stream{cols: lp.cols, rows: union(l.rows, r.rows, conds)}, nil
+		return stream{cols: lp.cols, rows: union(l.rows, r.rows, conds), rowsFP: rowsFP}, nil
 	case "RIGHT_SEMI", "RIGHT_ANTI":
-		return stream{cols: rp.cols, rows: union(l.rows, r.rows, conds)}, nil
+		return stream{cols: rp.cols, rows: union(l.rows, r.rows, conds), rowsFP: rowsFP}, nil
 	case "MARK":
 		// One boolean column: whether a match exists on the right.
-		mark := col{direct: union(conds, r.rows), indirect: refSet{}}
+		mark := col{direct: union(conds, r.rows), indirect: refSet{}, fp: Hash("mark", r.rowsFP, condFP)}
 		if idx, ok := num(n, "mark_index"); ok {
 			w.bindings[idx] = []col{mark}
 		}
-		return stream{cols: concat(lp.cols, []col{mark}), rows: union(l.rows)}, nil
+		return stream{cols: concat(lp.cols, []col{mark}), rows: union(l.rows), rowsFP: l.rowsFP}, nil
 	default:
 		return stream{}, unsupported("unsupported join type %s", jt)
 	}
@@ -515,9 +592,18 @@ func (w *walker) join(n obj, l, r stream) (stream, error) {
 
 // expr returns the lineage of an expression over the input columns in.
 func (w *walker) expr(e any, in []col) (col, error) {
-	out := col{refSet{}, refSet{}}
-	err := w.collect(e, in, &out, false)
-	return out, err
+	out := newCol("")
+	if err := w.collect(e, in, &out, false); err != nil {
+		return col{}, err
+	}
+	// A bare column reference passes the column through unchanged, so a
+	// SELECT * layer or a CTE does not change fingerprints.
+	if t := str(asObj(e), "type"); t == "BOUND_REF" || t == "BOUND_COLUMN_REF" {
+		out.fp = strings.TrimPrefix(w.canon(e, in), "ref:")
+	} else {
+		out.fp = Hash("expr", w.canon(e, in))
+	}
+	return out, nil
 }
 
 func (w *walker) collect(v any, in []col, out *col, indirect bool) error {
@@ -609,11 +695,12 @@ func (w *walker) collect(v any, in []col, out *col, indirect bool) error {
 	return nil
 }
 
-// shaped returns copies of cols with extra indirect sources.
-func shaped(cols []col, by refSet) []col {
+// shaped returns copies of cols with extra indirect sources, as for the
+// nullable side of an outer join.
+func shaped(cols []col, by refSet, condFP string) []col {
 	out := make([]col, len(cols))
 	for i, c := range cols {
-		out[i] = col{direct: c.direct, indirect: union(c.indirect, by)}
+		out[i] = col{direct: c.direct, indirect: union(c.indirect, by), fp: Hash("outer", c.fp, condFP)}
 	}
 	return out
 }
@@ -623,7 +710,7 @@ func project(s stream, idxs []uint64) (stream, error) {
 	if len(idxs) == 0 {
 		return s, nil
 	}
-	out := stream{rows: s.rows}
+	out := stream{rows: s.rows, rowsFP: s.rowsFP}
 	for _, i := range idxs {
 		if i >= uint64(len(s.cols)) {
 			return stream{}, unsupported("projection map index %d out of range", i)
@@ -634,12 +721,12 @@ func project(s stream, idxs []uint64) (stream, error) {
 }
 
 // merge combines streams column by column, as set operations do.
-func merge(streams []stream) (stream, error) {
+func merge(typ string, streams []stream) (stream, error) {
 	out := stream{rows: refSet{}}
 	for _, s := range streams {
 		if len(out.cols) == 0 {
 			for range s.cols {
-				out.cols = append(out.cols, col{refSet{}, refSet{}})
+				out.cols = append(out.cols, newCol(typ))
 			}
 		}
 		if len(s.cols) != len(out.cols) {
@@ -648,6 +735,7 @@ func merge(streams []stream) (stream, error) {
 		for i, c := range s.cols {
 			out.cols[i].direct.add(c.direct)
 			out.cols[i].indirect.add(c.indirect)
+			out.cols[i].fp = Hash(out.cols[i].fp, c.fp)
 		}
 		out.rows.add(s.rows)
 	}

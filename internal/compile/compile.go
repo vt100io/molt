@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/vt100io/molt/internal/duckdb"
+	"github.com/vt100io/molt/internal/lineage"
 	"github.com/vt100io/molt/internal/project"
 )
 
@@ -51,6 +52,11 @@ type Options struct {
 	// FullRefresh rebuilds models from scratch. table and view models always
 	// are; the option exists for incremental models.
 	FullRefresh bool
+	// Columns and Lineage come from the shadow catalog and are recorded in
+	// _molt.columns and _molt.column_lineage. A model missing from Lineage is
+	// recorded without lineage.
+	Columns map[string][]project.Column
+	Lineage map[string]*lineage.Model
 }
 
 // Bookkeeping lives in the _molt schema of the same database and is written in
@@ -63,11 +69,33 @@ CREATE TABLE IF NOT EXISTS _molt.models (
     built_at  TIMESTAMPTZ NOT NULL,
     row_count BIGINT
 );
+ALTER TABLE _molt.models ADD COLUMN IF NOT EXISTS sql VARCHAR;
+ALTER TABLE _molt.models ADD COLUMN IF NOT EXISTS rows_fingerprint VARCHAR;
+ALTER TABLE _molt.models ADD COLUMN IF NOT EXISTS lineage VARCHAR;
 CREATE TABLE IF NOT EXISTS _molt.runs (
     run_at       TIMESTAMPTZ NOT NULL,
     models       VARCHAR[] NOT NULL,
     tests        INTEGER NOT NULL,
     full_refresh BOOLEAN NOT NULL
+);
+-- The output columns of each model as built. fingerprint identifies what the
+-- column computes, through every model upstream (see internal/lineage).
+CREATE TABLE IF NOT EXISTS _molt.columns (
+    model       VARCHAR NOT NULL,
+    name        VARCHAR NOT NULL,
+    position    INTEGER NOT NULL,
+    type        VARCHAR NOT NULL,
+    fingerprint VARCHAR,
+    PRIMARY KEY (model, name)
+);
+-- One hop of column lineage. kind is direct (the value flows in), indirect
+-- (shapes this column only) or rows (decides which rows exist; column is NULL).
+CREATE TABLE IF NOT EXISTS _molt.column_lineage (
+    model         VARCHAR NOT NULL,
+    "column"      VARCHAR,
+    source_model  VARCHAR NOT NULL,
+    source_column VARCHAR NOT NULL,
+    kind          VARCHAR NOT NULL
 )`
 
 // Compile builds the script for the selected models. Tests run after the
@@ -99,7 +127,7 @@ func Compile(p *project.Project, opts Options) (*Script, error) {
 			schemas[m.Schema] = true
 			add(StmtMeta, "schema "+m.Schema, "CREATE SCHEMA IF NOT EXISTS "+duckdb.QuoteIdent(m.Schema))
 		}
-		add(StmtModel, m.Name, modelSQL(m, opts.Existing[m.Name]))
+		add(StmtModel, m.Name, modelSQL(m, opts.Existing[m.Name], opts.Columns[m.Name], opts.Lineage[m.Name]))
 	}
 
 	tests := selectTests(p, opts.Models)
@@ -120,9 +148,9 @@ func Compile(p *project.Project, opts Options) (*Script, error) {
 }
 
 // modelSQL wraps a model's SELECT in the statement for its kind, followed by
-// its bookkeeping row. existing is the kind of the object already in the
+// its bookkeeping rows. existing is the kind of the object already in the
 // database under the model's name, if any.
-func modelSQL(m *project.Model, existing string) string {
+func modelSQL(m *project.Model, existing string, cols []project.Column, l *lineage.Model) string {
 	target := duckdb.QuoteIdent(m.Schema) + "." + duckdb.QuoteIdent(m.Table)
 
 	var b strings.Builder
@@ -141,9 +169,75 @@ func modelSQL(m *project.Model, existing string) string {
 		fmt.Fprintf(&b, "CREATE OR REPLACE VIEW %s AS %s\n;\n", target, m.SQL)
 	}
 
-	fmt.Fprintf(&b, "INSERT OR REPLACE INTO _molt.models VALUES (%s, %s, %s, current_timestamp, %s)",
-		duckdb.QuoteString(m.Name), duckdb.QuoteString(m.Kind), duckdb.QuoteString(m.Hash), rowCount)
+	rowsFP, lineageNote := "NULL", "NULL"
+	if l != nil {
+		rowsFP = nullable(l.RowsFingerprint)
+		lineageNote = "'exact'"
+		if l.Approximate != "" {
+			lineageNote = duckdb.QuoteString("approximate: " + l.Approximate)
+		}
+	}
+	name := duckdb.QuoteString(m.Name)
+	fmt.Fprintf(&b, "INSERT OR REPLACE INTO _molt.models "+
+		"(name, kind, sql_hash, built_at, row_count, sql, rows_fingerprint, lineage) "+
+		"VALUES (%s, %s, %s, current_timestamp, %s, %s, %s, %s)",
+		name, duckdb.QuoteString(m.Kind), duckdb.QuoteString(m.Hash), rowCount,
+		duckdb.QuoteString(m.SQL), rowsFP, lineageNote)
+	b.WriteString(columnsSQL(name, cols, l))
 	return b.String()
+}
+
+// columnsSQL replaces a model's rows in _molt.columns and _molt.column_lineage.
+func columnsSQL(name string, cols []project.Column, l *lineage.Model) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, ";\nDELETE FROM _molt.columns WHERE model = %s", name)
+	fmt.Fprintf(&b, ";\nDELETE FROM _molt.column_lineage WHERE model = %s", name)
+
+	fps := map[string]string{}
+	if l != nil {
+		for _, c := range l.Columns {
+			fps[c.Name] = c.Fingerprint
+		}
+	}
+	var values []string
+	for i, c := range cols {
+		values = append(values, fmt.Sprintf("(%s, %s, %d, %s, %s)",
+			name, duckdb.QuoteString(c.Name), i+1, duckdb.QuoteString(c.Type), nullable(fps[c.Name])))
+	}
+	if len(values) > 0 {
+		fmt.Fprintf(&b, ";\nINSERT INTO _molt.columns VALUES %s", strings.Join(values, ", "))
+	}
+
+	if l == nil {
+		return b.String()
+	}
+	values = nil
+	edge := func(column string, r lineage.Ref, kind string) {
+		values = append(values, fmt.Sprintf("(%s, %s, %s, %s, '%s')",
+			name, column, duckdb.QuoteString(r.Table), duckdb.QuoteString(r.Column), kind))
+	}
+	for _, c := range l.Columns {
+		for _, r := range c.Direct {
+			edge(duckdb.QuoteString(c.Name), r, "direct")
+		}
+		for _, r := range c.Indirect {
+			edge(duckdb.QuoteString(c.Name), r, "indirect")
+		}
+	}
+	for _, r := range l.Rows {
+		edge("NULL", r, "rows")
+	}
+	if len(values) > 0 {
+		fmt.Fprintf(&b, ";\nINSERT INTO _molt.column_lineage VALUES %s", strings.Join(values, ", "))
+	}
+	return b.String()
+}
+
+func nullable(s string) string {
+	if s == "" {
+		return "NULL"
+	}
+	return duckdb.QuoteString(s)
 }
 
 // testSQL raises an error, which aborts the transaction, when the test query returns rows.

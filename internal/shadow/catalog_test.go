@@ -49,9 +49,9 @@ func TestBuildResolvesRealSchemas(t *testing.T) {
 	}
 
 	want := map[string][]Column{
-		"main.src": {{"id", "BIGINT"}, {"name", "VARCHAR"}, {"data", "JSON"}},
-		"main.mid": {{"id", "BIGINT"}, {"name_u", "VARCHAR"}, {"premium", "INTEGER"}},
-		"main.top": {{"id", "BIGINT"}, {"doubled", "INTEGER"}},
+		"main.src": {{Name: "id", Type: "BIGINT"}, {Name: "name", Type: "VARCHAR"}, {Name: "data", Type: "JSON"}},
+		"main.mid": {{Name: "id", Type: "BIGINT"}, {Name: "name_u", Type: "VARCHAR"}, {Name: "premium", Type: "INTEGER"}},
+		"main.top": {{Name: "id", Type: "BIGINT"}, {Name: "doubled", Type: "INTEGER"}},
 	}
 	if !reflect.DeepEqual(c.Schemas, want) {
 		t.Errorf("Schemas = %v, want %v", c.Schemas, want)
@@ -137,6 +137,12 @@ func TestLineageStopsAtViewModels(t *testing.T) {
 	want := []lineage.Column{
 		{Name: "id", Direct: []lineage.Ref{{Table: "main.big", Column: "id"}}, Indirect: []lineage.Ref{}},
 		{Name: "d", Direct: []lineage.Ref{{Table: "main.big", Column: "doubled"}}, Indirect: []lineage.Ref{}},
+	}
+	for i := range l.Columns {
+		if l.Columns[i].Fingerprint == "" {
+			t.Errorf("column %s has no fingerprint", l.Columns[i].Name)
+		}
+		l.Columns[i].Fingerprint = ""
 	}
 	if !reflect.DeepEqual(l.Columns, want) {
 		t.Errorf("top columns = %+v, want %+v", l.Columns, want)

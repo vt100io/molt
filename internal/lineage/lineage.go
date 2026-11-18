@@ -67,6 +67,9 @@ type Column struct {
 	// Indirect lists upstream columns that shape this column only (window
 	// partitions and orders, aggregate filters), beyond the model's Rows.
 	Indirect []Ref
+	// Fingerprint identifies what the column computes, through every model
+	// upstream; see fingerprint.go.
+	Fingerprint string
 }
 
 // Model is the lineage of one model: one hop, from its output columns to the
@@ -80,6 +83,8 @@ type Model struct {
 	// understand; it holds the reason. Every column then lists every column the
 	// plan reads as Direct.
 	Approximate string
+	// RowsFingerprint identifies what decides the model's rows.
+	RowsFingerprint string
 }
 
 // refSet is a set of upstream columns.

@@ -54,7 +54,7 @@ func analyze(t *testing.T, db *sql.DB, query string) *Model {
 		}
 		names = append(names, name)
 	}
-	m, err := Analyze([]byte(plan), names)
+	m, err := Analyze([]byte(plan), names, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +266,7 @@ func TestUnsupportedOperatorIsApproximate(t *testing.T) {
 		{"type":"LOGICAL_GET","children":[],"table_index":0,"names":["id","name"],
 		 "function_data":{"catalog":"memory","schema":"shop","table":"customers"},
 		 "column_indexes":[{"index":1}]}]}]}`
-	m, err := Analyze([]byte(plan), []string{"a", "b"})
+	m, err := Analyze([]byte(plan), []string{"a", "b"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +281,7 @@ func TestUnsupportedOperatorIsApproximate(t *testing.T) {
 }
 
 func TestPlanError(t *testing.T) {
-	_, err := Analyze([]byte(`{"error":true,"error_message":"CSVReaderSerialize not implemented"}`), nil)
+	_, err := Analyze([]byte(`{"error":true,"error_message":"CSVReaderSerialize not implemented"}`), nil, nil)
 	if _, ok := err.(*PlanError); !ok {
 		t.Fatalf("err = %v, want *PlanError", err)
 	}
@@ -300,5 +300,82 @@ func TestDuckDBVersionIsSupported(t *testing.T) {
 	}
 	if CheckVersion("v1.5.6") == nil {
 		t.Error("v1.5.6 should not be supported")
+	}
+}
+
+func fingerprints(m *Model) map[string]string {
+	out := map[string]string{"<rows>": m.RowsFingerprint}
+	for _, c := range m.Columns {
+		out[c.Name] = c.Fingerprint
+	}
+	return out
+}
+
+func TestFingerprints(t *testing.T) {
+	db := testDB(t)
+	base := fingerprints(analyze(t, db, `SELECT id, amount * 2 AS doubled, status FROM shop.orders WHERE status <> 'x'`))
+
+	same := []string{
+		// Formatting, comments, aliases and table aliases.
+		"-- comment\nselect o.id,\n  o.amount*2 as doubled, o.status\nfrom shop.orders as o where o.status != 'x'",
+		// A CTE shifts every table index.
+		`WITH o AS (SELECT * FROM shop.orders) SELECT id, amount * 2 AS doubled, status FROM o WHERE status <> 'x'`,
+	}
+	for _, q := range same {
+		if got := fingerprints(analyze(t, db, q)); !reflect.DeepEqual(got, base) {
+			t.Errorf("%s\nfingerprints differ: %v vs %v", q, got, base)
+		}
+	}
+
+	changes := []struct {
+		query   string
+		changed []string
+	}{
+		{`SELECT id, amount * 3 AS doubled, status FROM shop.orders WHERE status <> 'x'`, []string{"doubled"}},
+		{`SELECT id, amount * 2 AS doubled, status, customer_id FROM shop.orders WHERE status <> 'x'`, []string{"customer_id"}},
+		{`SELECT id, amount * 2 AS doubled, upper(status) AS status FROM shop.orders WHERE status <> 'x'`, []string{"status"}},
+		{`SELECT id, amount * 2 AS doubled, status FROM shop.orders WHERE status <> 'y'`, []string{"<rows>"}},
+		{`SELECT id, amount * 2 AS doubled, status FROM shop.orders WHERE status <> 'x' LIMIT 5`, []string{"<rows>"}},
+	}
+	for _, c := range changes {
+		got := fingerprints(analyze(t, db, c.query))
+		var changed []string
+		for name, fp := range got {
+			if base[name] != fp {
+				changed = append(changed, name)
+			}
+		}
+		if !reflect.DeepEqual(changed, c.changed) {
+			t.Errorf("%s\nchanged = %v, want %v", c.query, changed, c.changed)
+		}
+	}
+}
+
+func TestFingerprintsFollowUpstream(t *testing.T) {
+	db := testDB(t)
+	q := `SELECT id, sum(amount) AS total FROM shop.orders GROUP BY id`
+	plain := fingerprints(analyze(t, db, q))
+
+	var plan string
+	if err := db.QueryRow("SELECT json_serialize_plan(?, optimize := false)::VARCHAR", q).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	// Upstream amount changed: total changes, and with it the group's input
+	// rows; id is a group key over the same rows, so it changes too.
+	m, err := Analyze([]byte(plan), []string{"id", "total"}, func(table, column string) string {
+		if column == "amount" {
+			return "changed"
+		}
+		return Hash("table", table, column)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := fingerprints(m)
+	if got["total"] == plain["total"] {
+		t.Error("total should change when upstream amount changes")
+	}
+	if got["id"] != plain["id"] || got["<rows>"] != plain["<rows>"] {
+		t.Error("id and rows should not change when only upstream amount changes")
 	}
 }

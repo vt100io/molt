@@ -26,10 +26,8 @@ import (
 	"github.com/vt100io/molt/internal/project"
 )
 
-type Column struct {
-	Name string
-	Type string
-}
+// Column is an output column of a model.
+type Column = project.Column
 
 type Catalog struct {
 	db      *sql.DB
@@ -45,6 +43,7 @@ type Catalog struct {
 
 	version    string // DuckDB version, read on first use by Lineage
 	versionErr error
+	lineage    map[string]*lineage.Model
 }
 
 // Build creates the shadow catalog for a project. A model that fails to bind
@@ -140,8 +139,12 @@ func (c *Catalog) Explain(modelName string) (string, error) {
 }
 
 // Lineage returns the column lineage of a model: for each output column, the
-// columns of upstream models it comes from. See package lineage.
+// columns of upstream models it comes from, and its fingerprint. See package
+// lineage. Upstream models are traced first, since fingerprints build on theirs.
 func (c *Catalog) Lineage(modelName string) (*lineage.Model, error) {
+	if l, ok := c.lineage[modelName]; ok {
+		return l, nil
+	}
 	m, ok := c.project.Models[modelName]
 	if !ok {
 		return nil, fmt.Errorf("model %s not found", modelName)
@@ -160,6 +163,15 @@ func (c *Catalog) Lineage(modelName string) (*lineage.Model, error) {
 		return nil, c.versionErr
 	}
 
+	upstream := map[string]*lineage.Model{}
+	for _, dep := range m.Dependencies {
+		l, err := c.Lineage(dep)
+		if err != nil {
+			return nil, err
+		}
+		upstream[dep] = l
+	}
+
 	// Unoptimized, so the plan follows the SQL as written. Cast to VARCHAR: the
 	// driver otherwise decodes the JSON type itself.
 	var plan string
@@ -171,17 +183,75 @@ func (c *Catalog) Lineage(modelName string) (*lineage.Model, error) {
 	for i, col := range c.Schemas[modelName] {
 		names[i] = col.Name
 	}
-	l, err := lineage.Analyze([]byte(plan), names)
+	l, err := lineage.Analyze([]byte(plan), names, fingerprintsOf(upstream))
 	var planErr *lineage.PlanError
-	if errors.As(err, &planErr) {
+	switch {
+	case errors.As(err, &planErr):
 		// DuckDB cannot serialize every plan; table functions such as
 		// read_csv have no serializer. Fall back to the model's dependencies.
-		return c.lineageFromDependencies(m, names, planErr.Message), nil
-	}
-	if err != nil {
+		l = c.lineageFromDependencies(m, names, planErr.Message)
+		opaqueFingerprints(l, m, upstream)
+	case err != nil:
 		return nil, fmt.Errorf("lineage of %s: %w", modelName, err)
+	case l.Approximate != "":
+		opaqueFingerprints(l, m, upstream)
 	}
+
+	if c.lineage == nil {
+		c.lineage = map[string]*lineage.Model{}
+	}
+	c.lineage[modelName] = l
 	return l, nil
+}
+
+// Pin sets the lineage of a model instead of tracing it. molt run pins the
+// models it does not rebuild to the fingerprints recorded when they were
+// built, so the models it does rebuild record fingerprints that match the
+// data they were built from.
+func (c *Catalog) Pin(modelName string, l *lineage.Model) {
+	if c.lineage == nil {
+		c.lineage = map[string]*lineage.Model{}
+	}
+	c.lineage[modelName] = l
+}
+
+// fingerprintsOf gives the fingerprints of upstream model columns. A column's
+// values depend on the model's rows too, so both go into what a downstream
+// plan sees. Tables that are not models are identified by name.
+func fingerprintsOf(models map[string]*lineage.Model) lineage.Upstream {
+	return func(table, column string) string {
+		l, ok := models[table]
+		if !ok {
+			return lineage.Hash("table", table, column)
+		}
+		if column == "" {
+			return l.RowsFingerprint
+		}
+		for _, c := range l.Columns {
+			if c.Name == column {
+				return lineage.Hash(c.Fingerprint, l.RowsFingerprint)
+			}
+		}
+		return lineage.Hash("missing", table, column)
+	}
+}
+
+// opaqueFingerprints fingerprints a model whose plan could not be walked: from
+// its SQL and everything upstream, so any change to either changes them all.
+func opaqueFingerprints(l *lineage.Model, m *project.Model, upstream map[string]*lineage.Model) {
+	parts := []string{"opaque", m.SQL}
+	for _, dep := range m.Dependencies {
+		u := upstream[dep]
+		parts = append(parts, dep, u.RowsFingerprint)
+		for _, c := range u.Columns {
+			parts = append(parts, c.Name, c.Fingerprint)
+		}
+	}
+	base := lineage.Hash(parts...)
+	l.RowsFingerprint = lineage.Hash("rows", base)
+	for i := range l.Columns {
+		l.Columns[i].Fingerprint = lineage.Hash(base, l.Columns[i].Name)
+	}
 }
 
 // lineageFromDependencies is the fallback when DuckDB cannot serialize a
