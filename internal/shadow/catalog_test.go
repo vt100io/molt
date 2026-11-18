@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/vt100io/molt/internal/lineage"
 	"github.com/vt100io/molt/internal/project"
 )
 
@@ -109,4 +110,62 @@ func TestExplainUsesRealSchemas(t *testing.T) {
 	if !strings.Contains(plan, "src") {
 		t.Errorf("plan does not scan src:\n%s", plan)
 	}
+}
+
+func TestLineageStopsAtViewModels(t *testing.T) {
+	csv := writeCSV(t)
+	p := loadProject(t, map[string]string{
+		"src":  "SELECT 1 AS id, 2.5 AS amount",
+		"big":  "-- @kind: view\nSELECT id, amount * 2 AS doubled FROM src",
+		"top":  "SELECT id, doubled + 1 AS d FROM big",
+		"file": "SELECT * FROM read_csv('" + csv + "')",
+		// Reads a file and a model in the same plan.
+		"both": "SELECT f.a, s.id FROM read_csv('" + csv + "') f JOIN src s ON f.a = s.id",
+	})
+
+	c, err := Build(p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	l, err := c.Lineage("main.top")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Through the view model, not past it to main.src.
+	want := []lineage.Column{
+		{Name: "id", Direct: []lineage.Ref{{Table: "main.big", Column: "id"}}, Indirect: []lineage.Ref{}},
+		{Name: "d", Direct: []lineage.Ref{{Table: "main.big", Column: "doubled"}}, Indirect: []lineage.Ref{}},
+	}
+	if !reflect.DeepEqual(l.Columns, want) {
+		t.Errorf("top columns = %+v, want %+v", l.Columns, want)
+	}
+
+	// read_csv cannot be serialized; without upstream models that is exact.
+	l, err = c.Lineage("main.file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.Approximate != "" || len(l.Columns) != 1 || len(l.Columns[0].Direct) != 0 {
+		t.Errorf("file lineage = %+v, want one column without sources", l)
+	}
+
+	// With upstream models it falls back to all their columns.
+	l, err = c.Lineage("main.both")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.Approximate == "" || len(l.Columns[1].Direct) != 2 {
+		t.Errorf("both lineage = %+v, want approximate over src.id, src.amount", l)
+	}
+}
+
+func writeCSV(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "f.csv")
+	if err := os.WriteFile(path, []byte("a\n1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

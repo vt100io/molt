@@ -343,7 +343,14 @@ var checkCmd = &cobra.Command{
 				fmt.Printf("✗ %s: %v\n", name, err)
 				continue
 			}
-			fmt.Printf("✓ %s (%d columns)\n", name, len(catalog.Schemas[name]))
+			note := ""
+			// Lineage is informational: a model whose lineage cannot be traced still passes.
+			if l, err := catalog.Lineage(name); err != nil {
+				note = fmt.Sprintf(", no lineage: %v", err)
+			} else if l.Approximate != "" {
+				note = fmt.Sprintf(", approximate lineage: %s", l.Approximate)
+			}
+			fmt.Printf("✓ %s (%d columns%s)\n", name, len(catalog.Schemas[name]), note)
 		}
 
 		if n := len(catalog.Errors); n > 0 {
@@ -409,7 +416,7 @@ func init() {
 			"Rebuild models from scratch (table and view models always are)")
 	}
 
-	rootCmd.AddCommand(runCmd, compileCmd, testCmd, checkCmd, schemaCmd, explainCmd, graphCmd)
+	rootCmd.AddCommand(runCmd, compileCmd, testCmd, checkCmd, schemaCmd, explainCmd, lineageCmd, graphCmd)
 }
 
 func main() {

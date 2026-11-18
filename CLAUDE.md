@@ -25,6 +25,7 @@ go run ./cmd/molt/... test
 go run ./cmd/molt/... check
 go run ./cmd/molt/... schema [model]
 go run ./cmd/molt/... explain <model>
+go run ./cmd/molt/... lineage <model> [column]
 go run ./cmd/molt/... graph
 
 # Override a variable from init.sql, e.g. a different data directory
@@ -57,7 +58,13 @@ A model is a `SELECT`. Its kind (`table` default, or `view`) is a directive in t
 
 ### Shadow catalog
 
-`internal/shadow/catalog.go` builds an in-memory DuckDB where every model exists with its real output schema but no data: after init.sql, table models are created with `CREATE TABLE ... AS SELECT * FROM (<sql>) LIMIT 0`, view models as views, in topological order. Used by `check`, `schema` and `explain`. A model that fails to bind is recorded in `Catalog.Errors`; its downstream models as `upstream model X failed`. This is the foundation for column-level lineage.
+`internal/shadow/catalog.go` builds an in-memory DuckDB where every model exists with its real output schema but no data: after init.sql, every model, views included, is created with `CREATE TABLE ... AS SELECT * FROM (<sql>) LIMIT 0`, in topological order. Views are tables here on purpose: the binder would otherwise inline a view into downstream plans and lineage would skip it. Used by `check`, `schema`, `explain` and `lineage`. A model that fails to bind is recorded in `Catalog.Errors`; its downstream models as `upstream model X failed`.
+
+### Column lineage
+
+`internal/lineage` walks DuckDB's bound plan, `json_serialize_plan(sql, optimize := false)` against the shadow catalog (`Catalog.Lineage`). Expressions are mostly `BOUND_REF` (a position in the child's output), so each operator defines how its output columns are composed (join: left ++ right, aggregate: groups ++ aggregates ++ grouping functions, window/unnest: child ++ new columns, CTE_REF: the CTE's output); `BOUND_COLUMN_REF` (table_index, column_index) occurs in table in-out function inputs and is resolved through a table_index map. Lineage is one hop: output column → upstream model columns, `direct` (value flows in) or `indirect` (filters, join conditions, group keys, window partitions). `Model.Rows` holds indirect sources that decide which rows exist; per-column `Indirect` holds the rest (outer-join conditions, window partitions/orders, aggregate FILTER).
+
+Unknown operators make the model `Approximate` (every column depends on every column read) rather than failing. Plans DuckDB cannot serialize (`read_csv` and other table functions) fall back to the model's dependencies, which is exact for source models. The plan JSON is not a stable DuckDB API: `lineage.SupportedVersions` lists verified DuckDB versions and `TestDuckDBVersionIsSupported` fails on an upgrade until the tests are rerun and the list extended.
 
 ### Key Design Decisions
 
@@ -71,6 +78,7 @@ A model is a `SELECT`. Its kind (`table` default, or `view`) is a directive in t
 
 ```
 cmd/molt/main.go          — CLI (cobra): run, compile, test, check, schema, explain, graph
+cmd/molt/lineage.go       — lineage command
 internal/
   project/project.go     — Project, Model, Test; loading, headers, Resolve
   duckdb/analyzer.go     — dependency extraction (parser AST), quoting, --var statements
@@ -78,7 +86,8 @@ internal/
     dag.go               — topological sort and selection (model, model+)
     execute.go           — runs a compiled script on one connection, rolls back on error
   compile/compile.go     — project → SQL script; _molt bookkeeping; existing objects
-  shadow/catalog.go      — shadow catalog for check/schema/explain
+  shadow/catalog.go      — shadow catalog for check/schema/explain/lineage
+  lineage/               — column lineage from DuckDB's bound plan
 init.sql                 — example project setup (DATA_DIR)
 models/, tests/          — example project
 molt.duckdb               — build output (gitignored)

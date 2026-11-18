@@ -1,21 +1,28 @@
 // Package shadow builds a shadow catalog: an in-memory DuckDB where every model
 // exists with its real output schema but no data.
 //
-// After running init.sql, models are created in dependency order: table models
-// with CREATE TABLE ... AS ... LIMIT 0, view models as views. Each one is bound
-// against the real columns of its upstream models without processing any data.
-// This validates column references before a run and gives the planner real
-// schemas to work with (explain, and later lineage).
+// After running init.sql, models are created in dependency order with
+// CREATE TABLE ... AS SELECT * FROM (...) LIMIT 0. Each one is bound against the
+// real columns of its upstream models without processing any data. This
+// validates column references before a run and gives the planner real schemas
+// to work with (explain, lineage).
+//
+// View models are created as empty tables too. DuckDB's binder expands a view
+// into the plan of whatever reads it, so a downstream model's plan would skip
+// over the view and its lineage would jump straight to the view's own sources.
+// As a table, every model is a boundary and lineage goes one model at a time.
 package shadow
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/vt100io/molt/internal/build"
 	"github.com/vt100io/molt/internal/duckdb"
+	"github.com/vt100io/molt/internal/lineage"
 	"github.com/vt100io/molt/internal/project"
 )
 
@@ -35,6 +42,9 @@ type Catalog struct {
 	// Errors holds the bind error of every model that failed, including models
 	// skipped because an upstream model failed.
 	Errors map[string]error
+
+	version    string // DuckDB version, read on first use by Lineage
+	versionErr error
 }
 
 // Build creates the shadow catalog for a project. A model that fails to bind
@@ -86,9 +96,6 @@ func Build(p *project.Project, vars map[string]string) (*Catalog, error) {
 		// model file. The closing parenthesis goes on its own line in case of a trailing comment.
 		target := duckdb.QuoteIdent(m.Schema) + "." + duckdb.QuoteIdent(m.Table)
 		createSQL := fmt.Sprintf("CREATE TABLE %s AS SELECT * FROM (%s\n) LIMIT 0", target, m.SQL)
-		if m.Kind == project.KindView {
-			createSQL = fmt.Sprintf("CREATE VIEW %s AS %s\n", target, m.SQL)
-		}
 		if _, err := db.Exec(createSQL); err != nil {
 			c.Errors[name] = err
 			continue
@@ -130,6 +137,72 @@ func (c *Catalog) Explain(modelName string) (string, error) {
 		return "", fmt.Errorf("failed to explain SQL: %w", err)
 	}
 	return plan, nil
+}
+
+// Lineage returns the column lineage of a model: for each output column, the
+// columns of upstream models it comes from. See package lineage.
+func (c *Catalog) Lineage(modelName string) (*lineage.Model, error) {
+	m, ok := c.project.Models[modelName]
+	if !ok {
+		return nil, fmt.Errorf("model %s not found", modelName)
+	}
+	if err, failed := c.Errors[modelName]; failed {
+		return nil, fmt.Errorf("cannot trace %s: %w", modelName, err)
+	}
+
+	if c.versionErr == nil && c.version == "" {
+		if err := c.db.QueryRow("SELECT version()").Scan(&c.version); err != nil {
+			return nil, fmt.Errorf("failed to read DuckDB version: %w", err)
+		}
+		c.versionErr = lineage.CheckVersion(c.version)
+	}
+	if c.versionErr != nil {
+		return nil, c.versionErr
+	}
+
+	// Unoptimized, so the plan follows the SQL as written. Cast to VARCHAR: the
+	// driver otherwise decodes the JSON type itself.
+	var plan string
+	if err := c.db.QueryRow("SELECT json_serialize_plan(?, optimize := false)::VARCHAR", m.SQL).Scan(&plan); err != nil {
+		return nil, fmt.Errorf("failed to plan %s: %w", modelName, err)
+	}
+
+	names := make([]string, len(c.Schemas[modelName]))
+	for i, col := range c.Schemas[modelName] {
+		names[i] = col.Name
+	}
+	l, err := lineage.Analyze([]byte(plan), names)
+	var planErr *lineage.PlanError
+	if errors.As(err, &planErr) {
+		// DuckDB cannot serialize every plan; table functions such as
+		// read_csv have no serializer. Fall back to the model's dependencies.
+		return c.lineageFromDependencies(m, names, planErr.Message), nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lineage of %s: %w", modelName, err)
+	}
+	return l, nil
+}
+
+// lineageFromDependencies is the fallback when DuckDB cannot serialize a
+// model's plan. A model without upstream models has no upstream columns, which
+// is exact. Otherwise every column gets every column of every upstream model:
+// coarse, but never missing a dependency.
+func (c *Catalog) lineageFromDependencies(m *project.Model, names []string, reason string) *lineage.Model {
+	var all []lineage.Ref
+	for _, dep := range m.Dependencies {
+		for _, col := range c.Schemas[dep] {
+			all = append(all, lineage.Ref{Table: dep, Column: col.Name})
+		}
+	}
+	l := &lineage.Model{}
+	if len(all) > 0 {
+		l.Approximate = "DuckDB cannot serialize the plan: " + reason
+	}
+	for _, name := range names {
+		l.Columns = append(l.Columns, lineage.Column{Name: name, Direct: all})
+	}
+	return l
 }
 
 // failedUpstream returns the first dependency of m that failed to bind, or "".
