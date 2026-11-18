@@ -204,6 +204,11 @@ func (c *Catalog) Lineage(modelName string) (*lineage.Model, error) {
 	return l, nil
 }
 
+// ResetLineage forgets traced and pinned lineage, so it is traced again.
+func (c *Catalog) ResetLineage() {
+	c.lineage = nil
+}
+
 // Pin sets the lineage of a model instead of tracing it. molt run pins the
 // models it does not rebuild to the fingerprints recorded when they were
 // built, so the models it does rebuild record fingerprints that match the

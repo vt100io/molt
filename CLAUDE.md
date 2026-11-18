@@ -71,7 +71,7 @@ Unknown operators make the model `Approximate` (every column depends on every co
 
 ### Plan
 
-`internal/plan` compares `_molt` (what was built: file hash, column types and fingerprints, rows fingerprint) with a fresh shadow catalog. Model statuses: added, removed, modified (file changed), affected (unchanged file, changed fingerprints upstream), unchanged, failed (does not bind). Breaking = an existing column changes or disappears, or the rows change; only added columns = non-breaking. Affected columns list the changed upstream columns they depend on (`Because`, from lineage). `molt run` with a selection pins unselected models to their recorded fingerprints (`Catalog.Pin`), so a partial build records fingerprints matching the data it was built from.
+`internal/plan` compares `_molt` (what was built: file hash, column types and fingerprints, rows fingerprint) with a fresh shadow catalog. Model statuses: added, removed, modified (file changed), affected (unchanged file, changed fingerprints upstream), unchanged, failed (does not bind). Breaking = an existing column changes or disappears, or the rows change; only added columns = non-breaking. Affected columns list the changed upstream columns they depend on (`Because`, from lineage). `molt run` with a selection pins unselected models to their recorded fingerprints (`Catalog.Pin`), so a partial build records fingerprints matching the data it was built from. `molt run` prints its plan before building: compared after pinning, so it shows what this run changes, and it lists changed models that are not selected. The plan is informational; the build always rebuilds the whole selection.
 
 ### Key Design Decisions
 

@@ -45,7 +45,7 @@ every column downstream whose data would change.
 		defer catalog.Close()
 
 		result := plan.Compare(built, p, catalog)
-		printPlan(result, len(built.Models) == 0)
+		printPlan(result, len(built.Models) == 0, nil)
 
 		for _, m := range result.Models {
 			if m.Status == plan.Failed {
@@ -56,12 +56,28 @@ every column downstream whose data would change.
 	},
 }
 
-func printPlan(result *plan.Plan, nothingBuilt bool) {
+// printPlan prints the changed models of a plan. With only, it prints only
+// those models (removed models are never part of a selection).
+func printPlan(result *plan.Plan, nothingBuilt bool, only map[string]bool) {
 	if nothingBuilt {
-		fmt.Printf("Nothing built in %s yet: every model is new.\n\n", dbPath)
+		fmt.Printf("Nothing built in %s yet: every model is new.\n", dbPath)
+		return
+	}
+	if only != nil {
+		filtered := &plan.Plan{}
+		for _, m := range result.Models {
+			if only[m.Name] {
+				filtered.Models = append(filtered.Models, m)
+			}
+		}
+		result = filtered
 	}
 	if !result.Changed() {
-		fmt.Printf("No changes: %s matches the project.\n", dbPath)
+		if only != nil {
+			fmt.Println("No changes in the selected models.")
+		} else {
+			fmt.Printf("No changes: %s matches the project.\n", dbPath)
+		}
 		return
 	}
 

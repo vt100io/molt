@@ -68,7 +68,19 @@ func openExisting() (*sql.DB, error) {
 	return sql.Open("duckdb", dbPath+"?access_mode=read_only")
 }
 
-func compileScript(p *project.Project, db *sql.DB, selectors []string) (*compile.Script, error) {
+// compiled is a script together with the plan of what it changes.
+type compiled struct {
+	script *compile.Script
+	// plan is what this script changes: for a selection, with unselected
+	// models as they were built. full compares the whole project.
+	plan  *plan.Plan
+	full  *plan.Plan
+	built *plan.Built
+	// models are the selected models, in build order.
+	models []string
+}
+
+func compileScript(p *project.Project, db *sql.DB, selectors []string) (*compiled, error) {
 	models, err := build.Select(p, selectors)
 	if err != nil {
 		return nil, err
@@ -79,11 +91,15 @@ func compileScript(p *project.Project, db *sql.DB, selectors []string) (*compile
 			return nil, err
 		}
 	}
-	columns, lin, err := analyzeColumns(p, db, models)
+	built, err := plan.LoadBuilt(db)
 	if err != nil {
 		return nil, err
 	}
-	return compile.Compile(p, compile.Options{
+	columns, lin, result, full, err := analyzeColumns(p, built, models)
+	if err != nil {
+		return nil, err
+	}
+	script, err := compile.Compile(p, compile.Options{
 		Models:      models,
 		Vars:        vars,
 		Existing:    existing,
@@ -91,27 +107,32 @@ func compileScript(p *project.Project, db *sql.DB, selectors []string) (*compile
 		Columns:     columns,
 		Lineage:     lin,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return &compiled{script: script, plan: result, full: full, built: built, models: models}, nil
 }
 
 // analyzeColumns binds the project in a shadow catalog and returns the output
-// columns and lineage of the selected models, to be recorded in _molt. A model
-// that fails to bind is left out: the build reports the real error. Without
-// lineage (an unverified DuckDB version) the build still runs.
+// columns and lineage of the selected models, to be recorded in _molt, and the
+// plans against what was built: of this run, and of the whole project. A model that fails to bind is left out: the
+// build reports the real error. Without lineage (an unverified DuckDB version)
+// the build still runs.
 //
 // Models that are not selected keep the fingerprints recorded when they were
 // built, since the selected models are built from their data as it is.
-func analyzeColumns(p *project.Project, db *sql.DB, models []string) (map[string][]shadow.Column, map[string]*lineage.Model, error) {
+func analyzeColumns(p *project.Project, built *plan.Built, models []string) (map[string][]shadow.Column, map[string]*lineage.Model, *plan.Plan, *plan.Plan, error) {
 	catalog, err := shadow.Build(p, vars)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	defer catalog.Close()
 
+	full := plan.Compare(built, p, catalog)
+	result := full
+
 	if len(models) < len(p.Models) {
-		built, err := plan.LoadBuilt(db)
-		if err != nil {
-			return nil, nil, err
-		}
+		catalog.ResetLineage()
 		selected := map[string]bool{}
 		for _, name := range models {
 			selected[name] = true
@@ -126,6 +147,7 @@ func analyzeColumns(p *project.Project, db *sql.DB, models []string) (map[string
 			}
 			catalog.Pin(name, l)
 		}
+		result = plan.Compare(built, p, catalog)
 	}
 
 	columns := map[string][]shadow.Column{}
@@ -139,7 +161,7 @@ func analyzeColumns(p *project.Project, db *sql.DB, models []string) (map[string
 			lin[name] = l
 		}
 	}
-	return columns, lin, nil
+	return columns, lin, result, full, nil
 }
 
 var runCmd = &cobra.Command{
@@ -147,7 +169,11 @@ var runCmd = &cobra.Command{
 	Short: "Build all models, or the selected ones, and run their tests in one transaction",
 	Long: `Build all models, or the selected ones, and run their tests in one transaction.
 "model+" selects a model and everything downstream of it. If any model or test
-fails, the transaction is rolled back and the database is unchanged.`,
+fails, the transaction is rolled back and the database is unchanged.
+
+Before building, run prints the plan: which columns of the selected models will
+change compared to what is built (see molt plan), and which changed models are
+not selected.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		p, err := project.LoadProject(".")
 		if err != nil {
@@ -160,10 +186,36 @@ fails, the transaction is rolled back and the database is unchanged.`,
 		}
 		defer db.Close()
 
-		script, err := compileScript(p, db, args)
+		c, err := compileScript(p, db, args)
 		if err != nil {
 			return err
 		}
+		script := c.script
+
+		selected := map[string]bool{}
+		for _, name := range c.models {
+			selected[name] = true
+		}
+		if len(c.models) < len(p.Models) {
+			fmt.Printf("Plan for %s:\n", plural(len(c.models), "selected model"))
+		} else {
+			fmt.Println("Plan:")
+		}
+		var only map[string]bool
+		if len(c.models) < len(p.Models) {
+			only = selected
+		}
+		printPlan(c.plan, len(c.built.Models) == 0, only)
+		var skipped []string
+		for _, m := range c.full.Models {
+			if !selected[m.Name] && m.Status != plan.Unchanged && m.Status != plan.Removed {
+				skipped = append(skipped, m.Name)
+			}
+		}
+		if len(skipped) > 0 {
+			fmt.Printf("Changed but not selected: %s\n", strings.Join(skipped, ", "))
+		}
+		fmt.Println()
 
 		start := time.Now()
 		var models, tests int
@@ -212,11 +264,11 @@ be run with the DuckDB CLI: duckdb -bail molt.duckdb < build.sql`,
 			defer db.Close()
 		}
 
-		script, err := compileScript(p, db, args)
+		c, err := compileScript(p, db, args)
 		if err != nil {
 			return err
 		}
-		fmt.Print(script.String())
+		fmt.Print(c.script.String())
 		return nil
 	},
 }
